@@ -19,7 +19,6 @@ from unittest import TestCase, skipIf
 
 import habana_frameworks.torch as ht
 import numpy as np
-import pytest
 import requests
 import torch
 from PIL import Image
@@ -33,6 +32,13 @@ from .utils import OH_DEVICE_CONTEXT
 
 adapt_transformers_to_gaudi()
 
+if OH_DEVICE_CONTEXT in ["gaudi2"]:
+    # Gaudi2 CI baselines
+    LATENCY_DETR_BF16_GRAPH_BASELINE = 7.0
+else:
+    # Gaudi1 CI baselines
+    LATENCY_DETR_BF16_GRAPH_BASELINE = 14.5
+
 
 def is_eager_mode():
     return os.environ.get("PT_HPU_LAZY_MODE", "1") == "0"
@@ -42,13 +48,6 @@ class GaudiDETRTester(TestCase):
     """
     Tests for Object Detection - DETR
     """
-
-    @pytest.fixture(autouse=True)
-    def _use_(self, baseline):
-        """
-        https://docs.pytest.org/en/stable/how-to/unittest.html#using-autouse-fixtures-and-accessing-other-fixtures
-        """
-        self.baseline = baseline
 
     def get_expected_loc(self, mode="default"):
         expected_location_def = np.array([344.0622, 24.8543, 640.3398, 373.7401])
@@ -142,11 +141,8 @@ class GaudiDETRTester(TestCase):
                 model_end_time = time.time()
                 total_model_time = total_model_time + (model_end_time - model_start_time)
 
-        self.baseline.assertRef(
-            compare=lambda latency, expect: latency <= (TIME_PERF_FACTOR * expect),
-            context=[OH_DEVICE_CONTEXT],
-            latency=total_model_time * 1000 / iterations,  # in terms of ms
-        )
+        latency = total_model_time * 1000 / iterations  # in terms of ms
+        self.assertLessEqual(latency, TIME_PERF_FACTOR * LATENCY_DETR_BF16_GRAPH_BASELINE)
 
 
 class GaudiDetrResnet50_Tester(GaudiDETRTester):
