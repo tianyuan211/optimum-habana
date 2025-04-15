@@ -16,15 +16,14 @@
 # Copyright (C) 2022-2024 Habana Labs, Ltd. an Intel Company
 ###############################################################################
 
-import math
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
+    KwargsForCausalLM,
     Qwen2Attention,
     Qwen2DecoderLayer,
     Qwen2ForCausalLM,
@@ -34,7 +33,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     apply_rotary_pos_emb,
     logger,
 )
-from transformers.utils import is_torchdynamo_compiling
+from transformers.processing_utils import Unpack
 
 from ...modeling_attn_mask_utils import (
     _gaudi_prepare_4d_causal_attention_mask,
@@ -69,10 +68,8 @@ import habana_frameworks.torch.core as htcore
 
 
 def gaudi_qwen2_rmsnorm_forward(self, hidden_states):
-    # 硬件检查
     if hidden_states.device.type == "hpu" and has_fused_rms_norm:
         # mixed dtypes are not good for FusedRMSNorm, both inputs need to have same dtype
-        # 处理数据类型不一致，使用融合的RMSNorm
         if hidden_states.dtype != self.weight.dtype:
             orig_dtype = hidden_states.dtype
             hidden_states = FusedRMSNorm.apply(hidden_states.to(self.weight.dtype), self.weight, self.variance_epsilon)
@@ -80,7 +77,6 @@ def gaudi_qwen2_rmsnorm_forward(self, hidden_states):
         else:
             hidden_states = FusedRMSNorm.apply(hidden_states, self.weight, self.variance_epsilon)
             return hidden_states
-    # 标准RMSNorm实现（用于非HPU设备）
     else:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -90,24 +86,21 @@ def gaudi_qwen2_rmsnorm_forward(self, hidden_states):
 
 
 class GaudiQwen2MLP(Qwen2MLP):
-    # 预处理，门控、上下采样
     def pre_mlp_forward(self, x):
         inputs = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         output = self.down_proj(inputs)
         return output
-    
-    # 分布式训练中的常见操作，用于在多个设备之间共享参数和梯度，确保不同设备上的计算结果一致
+
     def mlp_all_reduce(self, x):
         if hasattr(self.down_proj, "all_reduce"):
             self.down_proj.all_reduce(x)
-    # 确保在每个设备上处理的结果一致
+
     def post_mlp_forward(self, x):
         if hasattr(self.down_proj, "post_all_reduce"):
             return self.down_proj.post_all_reduce(x)
         return x
 
 
-# 根据输入的查询（query）、键（key）和值（value）张量的形状，调整它们的维度，并适应生成过程中所需的缓存策略
 def gaudi_qwen2_repeat_kv(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -134,7 +127,7 @@ def gaudi_qwen2_repeat_kv(
     return query_states, key_states, value_states, attention_mask
 
 
-# FusedScaledDotProductAttention，融合点积注意力
+# FusedScaledDotProductAttention
 class ModuleFusedSDPA(torch.nn.Module):
     def __init__(self, fusedSDPA, scale, attention_dropout, enable_recompute, flash_attention_fp8):
         super().__init__()
@@ -142,7 +135,6 @@ class ModuleFusedSDPA(torch.nn.Module):
         self.scale = scale
         self.attention_dropout = attention_dropout
         self.enable_recompute = enable_recompute
-        # FP8精度模式来加速计算。FP8是一种低精度数据格式，可以在保持较高性能的同时减少内存使用
         self.flash_attention_fp8 = flash_attention_fp8
 
     def forward(
@@ -174,6 +166,41 @@ class ModuleFusedSDPA(torch.nn.Module):
         )
 
 
+def gaudi_eager_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    attn_softmax_bf16: bool = False,
+    **kwargs,
+):
+    bsz, q_len = kwargs["input_shape"]
+    query_states, key_states, value_states, attention_mask = gaudi_qwen2_repeat_kv(
+        query, key, value, attention_mask, module.num_key_value_groups
+    )
+
+    query_states = query_states * scaling
+    attn_weights = module.matmul_qk(query_states, key_states.transpose(-2, -1)).float()
+    htcore.mark_step()
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    if attn_softmax_bf16:
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=query_states.dtype)
+    else:
+        # upcast attention to fp32
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = module.matmul_av(attn_weights, value_states)
+    attn_output = attn_output.reshape(bsz, -1, q_len, module.head_dim)
+
+    return attn_output, attn_weights
+
+
 class GaudiQwen2Attention(Qwen2Attention):
     def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
@@ -184,16 +211,13 @@ class GaudiQwen2Attention(Qwen2Attention):
         self.v_cache = KVCache()
 
         self.inp_seq_len = -1
-        self.norm_factor = 1.0 / math.sqrt(self.head_dim)
-        
-        # 旋转位置编码
+
         self.rotary_emb = GaudiRotaryEmbedding(config=self.config)
-        
-        # 融合的缩放点积注意力
+
         self.fused_scaled_dot_product_attention = (
             ModuleFusedSDPA(
                 FusedSDPA,
-                scale=self.norm_factor,
+                scale=self.scaling,
                 attention_dropout=self.attention_dropout,
                 enable_recompute=False,
                 flash_attention_fp8=getattr(config, "flash_attention_fp8", False),
@@ -201,8 +225,9 @@ class GaudiQwen2Attention(Qwen2Attention):
             if FusedSDPA
             else None
         )
-    
-    # 获取键（key）投影层的权重
+
+        self.num_key_value_heads = config.num_key_value_heads
+
     def get_k_proj_weight(self):
         """4bit quantization in GPTQ replaces the k_proj.weight with qweight."""
         if hasattr(self.k_proj, "qweight"):
@@ -215,16 +240,14 @@ class GaudiQwen2Attention(Qwen2Attention):
         if hasattr(self.k_proj, "qweight"):
             return self.k_proj.scales.dtype
         return self.k_proj.weight.dtype
-    
-    # 为键值缓存分配内存
+
     def allocate_kv_cache(self, batch_size, max_seq_len, inp_seq_len):
         cache_shape = (batch_size, self.num_key_value_heads, max_seq_len, self.head_dim)
         device = self.get_k_proj_weight().device
         dtype = self.config.torch_dtype
         self.k_cache.allocate(inp_seq_len, dtype, device, cache_shape)
         self.v_cache.allocate(inp_seq_len, dtype, device, cache_shape)
-    
-    # 更新旋转位置编码的余弦（cos）和正弦（sin）缓存
+
     def update_sincos_cache(self, seq_len):
         # Call rotary emb forward() to update cos/sin cache when infering more than self.max_position_embeddings
         # This helps in avoiding creation of these caches during actual model forward pass and
@@ -232,13 +255,11 @@ class GaudiQwen2Attention(Qwen2Attention):
         if seq_len > self.max_position_embeddings:
             self.max_position_embeddings = seq_len
             _, _ = self.rotary_emb(self.get_k_proj_weight(), seq_len=seq_len)
-    
-    # 重新排序张量的维度
+
     def reorder(self, tensor, beam_idx, dim_a, dim_b):
         updated = tensor.index_select(0, beam_idx)
         tensor.copy_(updated)
-    
-    # 重新排序键值缓存
+
     def reorder_kv_cache(self, beam_idx: torch.LongTensor):
         if self.k_cache.cache is None:
             return (None, None)
@@ -249,14 +270,12 @@ class GaudiQwen2Attention(Qwen2Attention):
         self.reorder(self.v_cache.cache, beam_idx, seq_length, head_dim)
         return (self.k_cache.cache.shape, self.v_cache.cache.shape)
 
-    # 执行自注意力的前向传播
     def pre_attn_forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         token_idx: Optional[torch.Tensor] = None,
@@ -283,15 +302,13 @@ class GaudiQwen2Attention(Qwen2Attention):
         - add new arg flash_attention_fast_softmax
         - add new arg num_virtual_tokens
         """
-        bsz, q_len, _ = hidden_states.size()
+        input_shape = hidden_states.shape[:-1]
+        q_len = input_shape[1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -311,7 +328,7 @@ class GaudiQwen2Attention(Qwen2Attention):
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_customized_rope(
-            query_states, key_states, cos, sin, position_ids, self.training
+            query_states, key_states, cos, sin, kwargs["position_ids"], self.training
         )
 
         if use_cache:
@@ -359,9 +376,17 @@ class GaudiQwen2Attention(Qwen2Attention):
         else:
             past_key_value = None
 
+        sliding_window = None
+        if (
+            self.config.use_sliding_window
+            and getattr(self.config, "sliding_window", None) is not None
+            and self.layer_idx >= self.config.max_window_layers
+        ):
+            sliding_window = self.config.sliding_window
+
         if use_flash_attention and FusedSDPA is not None:
-            
-            if q_len == 1 or self.training:
+            attn_weights = None
+            if q_len == 1:
                 # next token
                 attn_output = self.fused_scaled_dot_product_attention(
                     query_states,
@@ -378,17 +403,7 @@ class GaudiQwen2Attention(Qwen2Attention):
                 )
             else:
                 # first token
-                
-                # 根据参数决定 softmax_mode
-#               if flash_attention_fast_softmax:
-#                   softmax_mode = "fast"
-#               elif not attn_softmax_bf16:
-#                   softmax_mode = "fp32"
-#               else:
-#                   softmax_mode = "None"
-                
-                softmax_mode = "fp32"
-                
+                softmax_mode = "fast" if flash_attention_fast_softmax else "None"
                 if flash_attention_causal_mask:
                     attn_output = self.fused_scaled_dot_product_attention(
                         query_states,
@@ -419,45 +434,22 @@ class GaudiQwen2Attention(Qwen2Attention):
                     )
 
         else:
-            query_states, key_states, value_states, attention_mask = gaudi_qwen2_repeat_kv(
-                query_states, key_states, value_states, attention_mask, self.num_key_value_groups
-            )
-
-            query_states = query_states * self.norm_factor
-            attn_weights = self.matmul_qk(query_states, key_states.transpose(-2, -1)).float()
-            htcore.mark_step()
-
-            if attention_mask is not None:  # no matter the length, we just slice it
-                causal_mask = attention_mask
-                if cache_position is not None:
-                    causal_mask = attention_mask[:, :, cache_position, : key_states.shape[-2]]
-                attn_weights = attn_weights + causal_mask.float()
-
-            if attn_softmax_bf16:
-                attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=query_states.dtype)
-            else:
-                # upcast attention to fp32
-                attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-                    query_states.dtype
-                )
-            attn_weights = torch.nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-            attn_output = self.matmul_av(attn_weights, value_states)
-            attn_output = attn_output.reshape(bsz, -1, q_len, self.head_dim)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
+            attn_output, attn_weights = gaudi_eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=sliding_window,  # main diff with Llama
+                attn_softmax_bf16=attn_softmax_bf16,
+                input_shape=input_shape,
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(bsz, q_len, -1)
-
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
 
         if not reuse_cache and token_idx is not None and cache_idx is not None and q_len == 1:
             # Return only past key value shapes and not the tensors during decode phase (q len is 1)
@@ -486,15 +478,13 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
         self.mlp = GaudiQwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    
-    # 缓存管理
+
     def allocate_kv_cache(self, batch_size, max_seq_len, inp_seq_len):
         self.self_attn.allocate_kv_cache(batch_size, max_seq_len, inp_seq_len)
 
     def reorder_kv_cache(self, beam_idx: torch.LongTensor):
         return self.self_attn.reorder_kv_cache(beam_idx)
-    
-    # 旋转位置编码
+
     def update_sincos_cache(self, seq_len):
         self.self_attn.update_sincos_cache(seq_len)
 
@@ -507,6 +497,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         token_idx: Optional[torch.Tensor] = None,
         attn_softmax_bf16: Optional[bool] = False,
         reuse_cache: Optional[bool] = False,
@@ -520,8 +511,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
-        
-        # 自注意力
+
         hidden_states, self_attn_weights, present_key_value = self.pre_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -530,6 +520,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
             token_idx=token_idx,
             attn_softmax_bf16=attn_softmax_bf16,
             reuse_cache=reuse_cache,
@@ -542,8 +533,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
             num_virtual_tokens=num_virtual_tokens,
             **kwargs,
         )
-        
-        # 梯度同步, 确保不同设备之间的计算结果一致
+
         self.self_attn.attention_all_reduce(hidden_states)
         hidden_states, residual = self.post_attn_pre_mlp(hidden_states, residual)
 
@@ -557,8 +547,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
             outputs += (present_key_value,)
 
         return outputs
-    
-    # 自注意力的前向传播
+
     def pre_attn(
         self,
         hidden_states: torch.Tensor,
@@ -568,6 +557,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         token_idx: Optional[torch.Tensor] = None,
         attn_softmax_bf16: Optional[bool] = False,
         reuse_cache: Optional[bool] = False,
@@ -580,9 +570,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
         num_virtual_tokens: int = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        # 输入层的归一化
         hidden_states = self.input_layernorm(hidden_states)
-        # 自注意力计算
         hidden_states, attn_weights, present_key_value = self.self_attn.pre_attn_forward(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -591,6 +579,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
             token_idx=token_idx,
             attn_softmax_bf16=attn_softmax_bf16,
             reuse_cache=reuse_cache,
@@ -604,8 +593,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
             **kwargs,
         )
         return hidden_states, attn_weights, present_key_value
-    
-    # 先执行注意力后的前向处理，并应用残差连接。然后通过MLP的前处理操作（pre_mlp_forward）来进一步处理隐藏状态
+
     def post_attn_pre_mlp(self, hidden_states, residual):
         hidden_states = self.self_attn.post_attn_forward(hidden_states)
 
@@ -620,8 +608,7 @@ class GaudiQwen2DecoderLayer(Qwen2DecoderLayer):
 
         hidden_states = self.mlp.pre_mlp_forward(hidden_states)
         return hidden_states, residual
-    
-    # 执行MLP后的操作，结合残差连接，确保多层感知机的输出与输入相加
+
     def post_mlp(self, hidden_states, residual):
         hidden_states = self.mlp.post_mlp_forward(hidden_states)
 
@@ -644,18 +631,13 @@ class GaudiQwen2Model(Qwen2Model):
         super(Qwen2Model, self).__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        
-        # 嵌入层
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        
-        # 每个解码层都由自注意力（GaudiQwen2Attention）和多层感知机（GaudiQwen2MLP）构成
-        self.layers = nn.ModuleList(
+
+        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = torch.nn.ModuleList(
             [GaudiQwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self._attn_implementation = config._attn_implementation
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
-        # 训练过程中，启用梯度检查点技术，可以减少内存使用，适合处理大型模型，但会增加计算开销
+
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -694,7 +676,6 @@ class GaudiQwen2Model(Qwen2Model):
         cache_idx: int = None,
         lazy_mode: Optional[bool] = True,
         num_virtual_tokens: int = None,
-        **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -706,7 +687,7 @@ class GaudiQwen2Model(Qwen2Model):
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape
         elif inputs_embeds is not None:
@@ -714,12 +695,11 @@ class GaudiQwen2Model(Qwen2Model):
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
 
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            use_cache = False
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -761,7 +741,6 @@ class GaudiQwen2Model(Qwen2Model):
 
         # HPU specific mask generation
         if ignore_cache_position:
-            # 掩码处理
             causal_mask = _gaudi_prepare_4d_causal_attention_mask(
                 attention_mask,
                 input_ids.shape if input_ids is not None else (batch_size, seq_length),
@@ -782,7 +761,7 @@ class GaudiQwen2Model(Qwen2Model):
         if lazy_mode:
             htcore.mark_step()
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if (
                 lazy_mode
                 and not self.training
@@ -803,6 +782,7 @@ class GaudiQwen2Model(Qwen2Model):
                     output_attentions,
                     use_cache,
                     cache_position,
+                    None,
                     None,
                     attn_softmax_bf16,
                     False,
@@ -864,7 +844,6 @@ class GaudiQwen2Model(Qwen2Model):
 
 
 class GaudiQwen2ForCausalLM(Qwen2ForCausalLM):
-    # 管理推理过程中缓存的键值对
     def allocate_kv_cache(self, batch_size, max_seq_len, inp_seq_len):
         self.model.allocate_kv_cache(batch_size, max_seq_len, inp_seq_len)
 
@@ -887,7 +866,7 @@ class GaudiQwen2ForCausalLM(Qwen2ForCausalLM):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        num_logits_to_keep: int = 0,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         token_idx: Optional[torch.Tensor] = None,
         trim_logits: Optional[bool] = False,
         attn_softmax_bf16: Optional[bool] = False,
@@ -900,7 +879,7 @@ class GaudiQwen2ForCausalLM(Qwen2ForCausalLM):
         cache_idx: int = None,
         lazy_mode: Optional[bool] = True,
         num_virtual_tokens: int = None,
-        **kwargs,
+        **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -934,7 +913,6 @@ class GaudiQwen2ForCausalLM(Qwen2ForCausalLM):
             cache_idx=cache_idx,
             lazy_mode=lazy_mode,
             num_virtual_tokens=num_virtual_tokens,
-            **kwargs,
         )
 
         hidden_states = outputs[0]
@@ -945,28 +923,13 @@ class GaudiQwen2ForCausalLM(Qwen2ForCausalLM):
             else:
                 hidden_states = hidden_states[:, -1, :]
 
-        if labels is None and not is_torchdynamo_compiling():
-            logger.warning_once(
-                "Starting from v4.46, the `logits` model output will have the same type as the model (except at train time, where it will always be FP32)"
-            )
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        # TODO: remove the float() operation in v4.46
-        logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :]).float()
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :]).float()
 
         loss = None
         if labels is not None:
-            # Upcast to float if we need to compute the loss to avoid potential precision issues
-            logits = logits.float()
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = torch.nn.CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -998,8 +961,7 @@ class GaudiQwen2ForCausalLM(Qwen2ForCausalLM):
             )
             for layer_past in past
         )
-    
-    # 处理生成过程中的输入准备工作
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -1081,11 +1043,9 @@ class GaudiQwen2ForCausalLM(Qwen2ForCausalLM):
         return model_inputs
 
 
-# 优先使用Habana硬件的优化模块，如果不可用则回退到默认的实现
 def apply_customized_rope(q, k, cos, sin, position_ids, training=True):
     if q.device.type == "hpu" and has_fused_rope:
         return apply_customized_rope_module(q, k, cos, sin, position_ids, training)
     else:
         # keep the same implementation as Transformers v4.37.2
         return apply_rotary_pos_emb(q, k, cos[position_ids], sin[position_ids])
-    
