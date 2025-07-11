@@ -14,6 +14,7 @@
                     ],
                     "extra_arguments": [
                         "--max_seq_length 128",
+                        "--add_pad_token True",
                         "--use_hpu_graphs_for_inference"
                     ]
                 },
@@ -27,6 +28,7 @@
                     ],
                     "extra_arguments": [
                         "--max_seq_length 128",
+                        "--add_pad_token True",
                         "--use_hpu_graphs_for_inference"
                     ]
                 }
