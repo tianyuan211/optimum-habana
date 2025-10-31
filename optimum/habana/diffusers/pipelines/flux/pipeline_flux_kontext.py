@@ -463,7 +463,7 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
         
         # 6. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
-        latents, image_latents, latent_ids, image_ids = self.prepare_latents(
+        latents, latent_image_ids = self.prepare_latents(
             image,
             batch_size * num_images_per_prompt,
             num_channels_latents,
