@@ -80,11 +80,32 @@ EXAMPLE_DOC_STRING = """
         >>> prompt = "add a hat to the cat"
 
         >>> image = pipe(
-        ...     prompt=prompt, image=init_image, num_inference_steps=30, strength=0.9, guidance_scale=3.5
+        ...     prompt=prompt, image=init_image, guidance_scale=3.5
         ... ).images[0]
         >>> image.save("flux_kontext.png")
         ```
 """
+        
+        
+PREFERRED_KONTEXT_RESOLUTIONS = [
+    (672, 1568),
+    (688, 1504),
+    (720, 1456),
+    (752, 1392),
+    (800, 1328),
+    (832, 1248),
+    (880, 1184),
+    (944, 1104),
+    (1024, 1024),
+    (1104, 944),
+    (1184, 880),
+    (1248, 832),
+    (1328, 800),
+    (1392, 752),
+    (1456, 720),
+    (1504, 688),
+    (1568, 672),
+]
 
 
 class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
@@ -465,7 +486,7 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
         num_channels_latents = self.transformer.config.in_channels // 4
         latents, image_latents, latent_ids, image_ids = self.prepare_latents(
             image,
-            batch_size * num_images_per_prompt,
+            num_prompts * num_images_per_prompt,
             num_channels_latents,
             height,
             width,
