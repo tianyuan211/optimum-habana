@@ -260,15 +260,15 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
+        image: Optional[PipelineImageInput] = None,
         prompt: Union[str, List[str]] = None,
         prompt_2: Optional[Union[str, List[str]]] = None,
-        image: PipelineImageInput = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         #strength: float = 0.6,
         num_inference_steps: int = 28,
         timesteps: List[int] = None,
-        guidance_scale: float = 7.0,
+        guidance_scale: float = 3.5,
         batch_size: int = 1,
         num_images_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -281,6 +281,8 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        max_area: int = 1024**2,
+        _auto_resize: bool = True,
         profiling_warmup_steps: Optional[int] = 0,
         profiling_steps: Optional[int] = 0,
         **kwargs,
@@ -408,8 +410,8 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
         
         original_height, original_width = height, width
         aspect_ratio = width / height
-        width = round((1024 ** 2 * aspect_ratio) ** 0.5)
-        height = round((1024 ** 2 / aspect_ratio) ** 0.5)
+        width = round((max_area * aspect_ratio) ** 0.5)
+        height = round((max_area / aspect_ratio) ** 0.5)
 
         multiple_of = self.vae_scale_factor * 2
         width = width // multiple_of * multiple_of
@@ -435,6 +437,7 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
 
         self._guidance_scale = guidance_scale
         self._joint_attention_kwargs = joint_attention_kwargs
+        self._current_timestep = None
         self._interrupt = False
 
 #       # 2. Preprocess image
@@ -452,21 +455,6 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
 
         device = self._execution_device
         
-        # 3. Preprocess image
-        if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
-            img = image[0] if isinstance(image, list) else image
-            image_height, image_width = self.image_processor.get_default_height_width(img)
-            aspect_ratio = image_width / image_height
-#           if _auto_resize:
-#               # Kontext is trained on specific resolutions, using one of them is recommended
-#               _, image_width, image_height = min(
-#                   (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
-#               )
-            image_width = image_width // multiple_of * multiple_of
-            image_height = image_height // multiple_of * multiple_of
-            image = self.image_processor.resize(image, image_height, image_width)
-            image = self.image_processor.preprocess(image, image_height, image_width)
-
         # 4. Run text encoder
         (
             prompt_embeds,
@@ -482,6 +470,22 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
             max_sequence_length=max_sequence_length,
         )
         
+        # 3. Preprocess image
+        if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
+            img = image[0] if isinstance(image, list) else image
+            image_height, image_width = self.image_processor.get_default_height_width(img)
+            aspect_ratio = image_width / image_height
+            if _auto_resize:
+                # Kontext is trained on specific resolutions, using one of them is recommended
+                _, image_width, image_height = min(
+                    (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
+                )
+            image_width = image_width // multiple_of * multiple_of
+            image_height = image_height // multiple_of * multiple_of
+            image = self.image_processor.resize(image, image_height, image_width)
+            image = self.image_processor.preprocess(image, image_height, image_width)
+
+                
         # 6. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
         latents, image_latents, latent_ids, image_ids = self.prepare_latents(
@@ -614,11 +618,15 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
                 timesteps = torch.roll(timesteps, shifts=-1, dims=0)
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = timestep.expand(latents_batch.shape[0]).to(latents_batch.dtype)
+                
+                latent_model_input = latents_batch
+                if image_latents is not None:
+                    latent_model_input = torch.cat([latents_batch, image_latents], dim=1)
 
                 if quant_mode == "quantize-mixed" and i >= quant_mixed_step:
                     # Mixed quantization
                     noise_pred = transformer_bf16(
-                        hidden_states=latents_batch,
+                        hidden_states=latent_model_input,
                         timestep=timestep / 1000,
                         guidance=guidance_batch,
                         pooled_projections=pooled_prompt_embeddings_batch,
@@ -628,9 +636,10 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
                         joint_attention_kwargs=self.joint_attention_kwargs,
                         return_dict=False,
                     )[0]
+                    noise_pred = noise_pred[:, : latents_batch.size(1)]
                 else:
                     noise_pred = self.transformer(
-                        hidden_states=latents_batch,
+                        hidden_states=latent_model_input,
                         timestep=timestep / 1000,
                         guidance=guidance_batch,
                         pooled_projections=pooled_prompt_embeddings_batch,
@@ -640,6 +649,7 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
                         joint_attention_kwargs=self.joint_attention_kwargs,
                         return_dict=False,
                     )[0]
+                    noise_pred = noise_pred[:, : latents_batch.size(1)]
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_batch = self.scheduler.step(noise_pred, timestep, latents_batch, return_dict=False)[0]
