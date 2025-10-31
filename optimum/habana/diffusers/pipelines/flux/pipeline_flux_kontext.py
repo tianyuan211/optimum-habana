@@ -463,7 +463,7 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
         
         # 6. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
-        latents, latent_image_ids = self.prepare_latents(
+        latents, image_latents, latent_ids, image_ids = self.prepare_latents(
             image,
             batch_size * num_images_per_prompt,
             num_channels_latents,
@@ -603,7 +603,7 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
                         pooled_projections=pooled_prompt_embeddings_batch,
                         encoder_hidden_states=text_embeddings_batch,
                         txt_ids=text_ids,
-                        img_ids=latent_image_ids,
+                        img_ids=latent_ids,
                         joint_attention_kwargs=self.joint_attention_kwargs,
                         return_dict=False,
                     )[0]
@@ -615,7 +615,7 @@ class GaudiFluxKontextPipeline(GaudiDiffusionPipeline, FluxKontextPipeline):
                         pooled_projections=pooled_prompt_embeddings_batch,
                         encoder_hidden_states=text_embeddings_batch,
                         txt_ids=text_ids,
-                        img_ids=latent_image_ids,
+                        img_ids=latent_ids,
                         joint_attention_kwargs=self.joint_attention_kwargs,
                         return_dict=False,
                     )[0]
